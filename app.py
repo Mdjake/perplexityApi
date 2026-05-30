@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # Configuration
 MAX_HISTORY = 100
-MAX_RESPONSE_SIZE = 1024 * 1024  # 1MB limit
+MAX_RESPONSE_SIZE = 1024 * 1024 * 10
 STREAM_TIMEOUT = 120
 CLEANUP_INTERVAL = 3600  # 1 hour
 

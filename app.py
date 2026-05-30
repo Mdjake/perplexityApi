@@ -4,17 +4,16 @@ import json
 import uuid
 import time
 import re
+import random
 from collections import deque
 from functools import lru_cache
 import gc
-import random
-
 
 app = Flask(__name__)
 
 # Configuration
 MAX_HISTORY = 100
-MAX_RESPONSE_SIZE = 1024 * 1024 * 10
+MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # Increased to 10MB for longer stories
 STREAM_TIMEOUT = 120
 CLEANUP_INTERVAL = 3600  # 1 hour
 
@@ -72,12 +71,18 @@ def home():
         }
     })
 
+def chunk_text(text, chunk_size=100):
+    """Split text into smaller chunks for real-time streaming"""
+    for i in range(0, len(text), chunk_size):
+        yield text[i:i + chunk_size]
+
 def stream_parse_response(response_stream):
-    """Memory-efficient streaming parser - yields chunks instead of loading all"""
+    """Memory-efficient streaming parser - yields chunks in real-time"""
     answer_parts = []
     sources = None
     metadata = {}
     total_size = 0
+    final_sent = False
     
     for line in response_stream.iter_lines(decode_unicode=True):
         if not line or not line.startswith('data: '):
@@ -99,6 +104,7 @@ def stream_parse_response(response_stream):
             if 'backend_uuid' in data:
                 metadata['backend_uuid'] = data['backend_uuid']
             
+            # Handle text-based responses
             if 'text' in data and data.get('step_type') == 'FINAL':
                 text_content = data['text']
                 try:
@@ -112,23 +118,29 @@ def stream_parse_response(response_stream):
                                     answer_text = answer_data.get('answer', '')
                                     sources = answer_data.get('web_results', [])
                                     if answer_text:
-                                        # Stream answer in chunks
-                                        for chunk in chunk_text(answer_text, 256):
+                                        # Stream answer in real-time chunks
+                                        for chunk in chunk_text(answer_text, 100):
                                             yield {"chunk": chunk}
+                                            time.sleep(0.01)  # Small delay for natural feel
                                         answer_parts.append(answer_text)
+                                        final_sent = True
                                     break
                 except:
                     pass
             
+            # Handle blocks-based responses
             if 'blocks' in data and not answer_parts:
                 for block in data['blocks']:
                     if block.get('intended_usage') in ['ask_text_0_markdown', 'ask_text']:
                         markdown_block = block.get('markdown_block', {})
                         if markdown_block.get('answer'):
                             answer_text = markdown_block['answer']
-                            for chunk in chunk_text(answer_text, 256):
+                            # Stream in real-time chunks
+                            for chunk in chunk_text(answer_text, 100):
                                 yield {"chunk": chunk}
+                                time.sleep(0.01)
                             answer_parts.append(answer_text)
+                            final_sent = True
                             break
         
         except json.JSONDecodeError:
@@ -138,24 +150,15 @@ def stream_parse_response(response_stream):
         if total_size % (1024 * 100) == 0:  # Every 100KB
             gc.collect()
     
-    # Send final response
-    yield {
-        "final": ''.join(answer_parts),
-        "sources": sources or [],
-        "metadata": metadata
-    }
-
-def chunk_text(text, chunk_size=256):
-    """Split text into smaller chunks for streaming"""
-    for i in range(0, len(text), chunk_size):
-        yield text[i:i + chunk_size]
-
-@lru_cache(maxsize=128)
-def get_cached_session_data(session_key):
-    """Cache session data with LRU eviction"""
-    # This would need to be implemented properly
-    # Simplified for example
-    return None
+    # Send completion marker
+    if final_sent:
+        yield {"done": True}
+    elif answer_parts:
+        yield {
+            "final": ''.join(answer_parts),
+            "sources": sources or [],
+            "metadata": metadata
+        }
 
 def scrape_fresh_session_memory_efficient():
     """Memory-optimized session scraper"""
@@ -165,7 +168,7 @@ def scrape_fresh_session_memory_efficient():
     headers = {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Encoding': 'gzip, deflate',  # Removed br/zstd for compatibility
+        'Accept-Encoding': 'gzip, deflate',
         'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
     }
     
@@ -230,7 +233,7 @@ def perplexity_ask_memory_efficient():
     mode = request.args.get('mode', 'concise')
     model = request.args.get('model', 'turbo')
     search_focus = request.args.get('search_focus', 'internet')
-    stream_mode = request.args.get('stream', 'false').lower() == 'true'
+    stream_mode = request.args.get('stream', 'true').lower() == 'true'  # Default to true now
     
     # Clean up old sessions periodically
     if random.random() < 0.01:  # 1% chance on each request
@@ -301,16 +304,25 @@ def perplexity_ask_memory_efficient():
             scraped['api_url'],
             json=payload,
             headers=headers,
-            stream=True,  # Important for memory efficiency
+            stream=True,
             timeout=STREAM_TIMEOUT
         )
         
         if stream_mode:
-            # Stream response back to client
+            # Stream response back to client in real-time
             def generate():
                 for chunk_data in stream_parse_response(response):
                     yield f"data: {json.dumps(chunk_data)}\n\n"
-            return Response(stream_with_context(generate()), mimetype='text/event-stream')
+            
+            return Response(
+                stream_with_context(generate()), 
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'X-Accel-Buffering': 'no',  # Disable nginx buffering
+                    'Content-Encoding': 'identity'  # No compression delay
+                }
+            )
         else:
             # Non-streaming but memory efficient
             answer_parts = []
@@ -329,9 +341,10 @@ def perplexity_ask_memory_efficient():
                 'status': 'success',
                 'prompt': prompt,
                 'answer': ''.join(answer_parts),
+                'sources': sources,
                 'mode': mode,
                 'model': model,
-                
+                'timestamp': int(time.time())
             }
             
             # Clear large objects

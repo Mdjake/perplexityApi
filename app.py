@@ -329,10 +329,9 @@ def perplexity_ask_memory_efficient():
                 'status': 'success',
                 'prompt': prompt,
                 'answer': ''.join(answer_parts),
-                'sources': sources,
                 'mode': mode,
                 'model': model,
-                'timestamp': int(time.time())
+                
             }
             
             # Clear large objects
